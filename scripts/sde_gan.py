@@ -39,6 +39,7 @@ import tqdm
 
 from thesis import models as mod
 import scipy.io as sio
+import torch.autograd.profiler as profiler
 
 
 ###################
@@ -173,9 +174,7 @@ class Generator(torch.nn.Module):
         # Normalise the data to the form that the discriminator expects, in particular including time as a channel.
         ###################
         ts = ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
-        # return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
-        # TODO I found that the linear interpolation didn't work so well before
-        return torch.cat([ts, ys], dim=2)
+        return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
 
 
 ###################
@@ -223,7 +222,7 @@ class Discriminator(torch.nn.Module):
         # hs = torchcde.cdeint(Y, self._func, h0, Y.interval, method='reversible_heun', backend='torchsde', dt=1.0,
                             #  adjoint_method='adjoint_reversible_heun',
                             #  adjoint_params=(ys_coeffs,) + tuple(self._func.parameters()))
-        hs = torchcde.cdeint(Y, self._func, h0, Y.interval, backend='torchsde', dt=0.1,
+        hs = torchcde.cdeint(Y, self._func, h0, Y.interval, backend='torchsde', dt=1.0,
                              adjoint_params=(ys_coeffs,) + tuple(self._func.parameters()))
         score = self._readout(hs[:, -1])
         return score.mean()
@@ -278,6 +277,15 @@ def get_data(batch_size, filename, device):
     ys_coeffs = torchcde.linear_interpolation_coeffs(ys)  # as per neural CDEs.
     dataset = torch.utils.data.TensorDataset(ys_coeffs)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Check that the linear interpolation is working
+    # Ys = torchcde.LinearInterpolation(ys_coeffs)
+    # ys_recon = Ys.evaluate(Ys._t)
+    # testfig, testax = plt.subplots()
+    # testax.plot(ts.cpu(), ys[1,:,1].cpu())
+    # testax.plot(ts.cpu(), ys_coeffs[1,:,1].cpu(), linestyle="dashed")
+    # testax.plot(ts.cpu(), ys_recon[1,:,1].cpu())
+    # plt.show()
 
     return ts, data_size, dataloader
 
@@ -335,8 +343,7 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs, ):
     ax1.legend()
     ax1.title.set_text(f"{num_plot_samples} samples from both real and generated distributions.")
     plt.tight_layout()
-    # plt.show()
-    fig1.savefig('output.png')
+    return fig1
 
 
 ###################
@@ -373,23 +380,27 @@ def main(
         noise_size=2,          # How many dimensions the Brownian motion has.
         hidden_size=4,        # How big the hidden size of the generator SDE and the discriminator CDE are.
         mlp_size=4,           # How big the layers in the various MLPs are.
-        num_layers=1,          # How many hidden layers to have in the various MLPs.
+        num_layers=4,          # How many hidden layers to have in the various MLPs.
 
         # Training hyperparameters. Be prepared to tune these very carefully, as with any GAN.
-        generator_lr=2e-1,      # Learning rate often needs careful tuning to the problem.
-        discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
-        batch_size=80,        # Batch size.# TODO originally 1024
-        steps=10,            # How many steps to train both generator and discriminator for.
-        init_mult1=10,           # Changing the initial parameter size can help.
+        generator_lr=1e1,      # Learning rate often needs careful tuning to the problem.
+        discriminator_lr=5e0,  # Learning rate often needs careful tuning to the problem.
+        batch_size=500,        # Batch size.# TODO originally 1024
+        steps=15,            # How many steps to train generator for.
+        disc_steps = 20,     # How many steps to train the discriminator for (per generator step)
+        init_mult1=3,           # Changing the initial parameter size can help.
         init_mult2=100,         #
         weight_decay=0.01,      # Weight decay.
         swa_step_start=1,    # When to start using stochastic weight averaging.
 
         # Evaluation and plotting hyperparameters
         steps_per_print=1,                   # How often to print the loss.
+        steps_per_plot=2,                    # how often to save a plot.
         num_plot_samples=5,                  # How many samples to use on the plots at the end.
         plot_locs=(0.1, 0.3, 0.5, 0.7, 0.9),  # Plot some marginal distributions at this proportion of the way along.
 ):
+    # TODO loss print statement is a bit misleading, as the loss printed at the end of the 
+    # training cycle is from before the generator update
     is_cuda = torch.cuda.is_available()
     device = 'cuda' if is_cuda else 'cpu'
     if not is_cuda:
@@ -422,44 +433,72 @@ def main(
             # Don't change the oscillator parameters, these are initialsed intentionally
                 continue
             param *= init_mult2
+    ###################
+    # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
+    # LipSwish activation functions).
+    ###################
+    with torch.no_grad():
+        for module in discriminator.modules():
+            if isinstance(module, torch.nn.Linear):
+                lim = 1 / module.out_features
+                module.weight.clamp_(-lim, lim)
 
     # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
     generator_optimiser = torch.optim.Adadelta(generator.parameters(), lr=generator_lr, weight_decay=weight_decay)
+    # Discriminator should maximise the function
     discriminator_optimiser = torch.optim.Adadelta(discriminator.parameters(), lr=discriminator_lr,
-                                                   weight_decay=weight_decay)
+                                                   weight_decay=weight_decay, maximize=True)
 
     # Train both generator and discriminator.
-    losses = torch.zeros(steps)
+    losses = torch.zeros(steps*(disc_steps+1))
     trange = tqdm.tqdm(range(steps))
     for step in trange:
-        real_samples, = next(infinite_train_dataloader)
+        # with profiler.profile(use_cuda=True) as prof:
 
+        # Train the discriminator (possibly multiple times)
+        print("Training Discriminator...")
+        real_samples, = next(infinite_train_dataloader)
+        generated_samples = generator(ts, batch_size).detach()
+        for disc_step in range(0, disc_steps):
+            generated_score = discriminator(generated_samples)
+            real_score = discriminator(real_samples)
+            loss = generated_score - real_score
+            loss.backward()
+            discriminator_optimiser.step()
+            # set_to_none apparently requires fewer memory operations: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+            discriminator_optimiser.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                losses[step*(disc_steps+1)+disc_step] = loss.item()
+                print("Loss: ", loss.item())
+            ###################
+            # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
+            # LipSwish activation functions).
+            ###################
+            with torch.no_grad():
+                for module in discriminator.modules():
+                    if isinstance(module, torch.nn.Linear):
+                        lim = 1 / module.out_features
+                        module.weight.clamp_(-lim, lim)
+            # print(prof.key_averages().table(sort_by="cuda_time_total"))
+
+        # Train the generator
+        print("Training Generator...")
         generated_samples = generator(ts, batch_size)
         generated_score = discriminator(generated_samples)
-        real_score = discriminator(real_samples)
-        loss = generated_score - real_score
-        print("Loss calculated, updating parameters...")
-        loss.backward() # This takes AGES
+        loss = generated_score
+        with torch.no_grad():
+            record_loss = generated_score.cpu() - real_score.cpu()
+            losses[step*(disc_steps+1)+disc_steps] = record_loss
+            print(f"Step: {step} Loss: {record_loss:.15f}")
+        loss.backward()
 
-        # Generator is minimising so reverse the sign of the parameter gradients
-        for param in generator.parameters():
-            param.grad *= -1
+        # Moved this to discriminator to be more consistent with the literature, practically it makes no difference
+        # for param in generator.parameters():
+            # param.grad *= -1
         # Update the parameters
         generator_optimiser.step()
-        discriminator_optimiser.step()
         # set_to_none apparently requires fewer memory operations: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
         generator_optimiser.zero_grad(set_to_none=True)
-        discriminator_optimiser.zero_grad(set_to_none=True)
-
-        ###################
-        # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
-        # LipSwish activation functions).
-        ###################
-        with torch.no_grad():
-            for module in discriminator.modules():
-                if isinstance(module, torch.nn.Linear):
-                    lim = 1 / module.out_features
-                    module.weight.clamp_(-lim, lim)
 
         print("Parameters updated, applying stochastic weight averaging (if requested)...")
         # Stochastic weight averaging typically improves performance.
@@ -467,21 +506,26 @@ def main(
         #     averaged_generator.update_parameters(generator)
         #     averaged_discriminator.update_parameters(discriminator)
 
-        if (step % steps_per_print) == 0 or step == steps - 1:
-            # TODO the evaluate loss takes forever!
-            # total_unaveraged_loss = evaluate_loss(ts, batch_size, train_dataloader, generator, discriminator)
-            if step > swa_step_start:
-                # total_averaged_loss = evaluate_loss(ts, batch_size, train_dataloader, averaged_generator.module,
-                                                    # averaged_discriminator.module)
-                # trange.write(f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
-                            #  f"Loss (averaged): {total_averaged_loss:.4f}")
-                trange.write(f"Step: {step:3} Loss (averaged): {loss:.4f} ")
-                losses[step] = loss
-            else:
-                trange.write(f"Step: {step:3} Loss (unaveraged): {loss:.4f}")
-                losses[step] = loss
+        # if (step % steps_per_print) == 0 or step == steps - 1:
+        #     # TODO the evaluate loss takes forever!
+        #     # total_unaveraged_loss = evaluate_loss(ts, batch_size, train_dataloader, generator, discriminator)
+        #     if step > swa_step_start:
+        #         # total_averaged_loss = evaluate_loss(ts, batch_size, train_dataloader, averaged_generator.module,
+        #                                             # averaged_discriminator.module)
+        #         # trange.write(f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
+        #                     #  f"Loss (averaged): {total_averaged_loss:.4f}")
+        #         trange.write(f"Step: {step:3} Loss (averaged): {record_loss:.4f} ")
+        #     else:
+        #         trange.write(f"Step: {step:3} Loss (unaveraged): {record_loss:.4f}")
+        if steps_per_plot>0 and (step % steps_per_plot) == 0:
+            _, _, test_dataloader = get_data(batch_size=batch_size, filename=filename, device=device)
+            fig = plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
+            title = f"output-{step}.png"
+            fig.savefig(title)
+
     # generator.load_state_dict(averaged_generator.module.state_dict())
     # discriminator.load_state_dict(averaged_discriminator.module.state_dict())
+
 
     # Print the harmonic oscillator parameters
     for name, param in generator.named_parameters():
@@ -489,11 +533,13 @@ def main(
             print("Harmonic oscillator trained params: ", param.data)
     _, _, test_dataloader = get_data(batch_size=batch_size, filename=filename, device=device)
 
-    plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
+    fig = plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
     with torch.no_grad():
         fig2, ax2 = plt.subplots()
         ax2.plot(losses)
-    plt.show()
+        ax2.title.set_text(f"Loss over iterations")
+        fig2.savefig("losses.png")
+    # plt.show() # too many plots to output
 
 
 if __name__ == '__main__':

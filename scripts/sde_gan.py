@@ -37,6 +37,7 @@ import torchcde
 import torchsde
 import tqdm
 
+from thesis import models as mod
 import scipy.io as sio
 
 
@@ -56,8 +57,6 @@ class MLP(torch.nn.Module):
         model = [torch.nn.Linear(in_size, mlp_size),
                  LipSwish()]
 
-        # TODO shows that NN is done in float32
-        # print(model[0].weight.dtype)
         for _ in range(num_layers - 1):
             model.append(torch.nn.Linear(mlp_size, mlp_size))
             ###################
@@ -74,6 +73,35 @@ class MLP(torch.nn.Module):
         return self._model(x)
 
 
+# Linear harmonic oscillator
+class LindxModel(torch.nn.Module):
+    def __init__(self, p0):
+        super().__init__()
+        self.p = torch.nn.Parameter(p0)
+
+    def forward(self, x):
+        return mod.LindxCouple(x, self.p, 0)
+
+class Drift(torch.nn.Module):
+    def __init__(self, hidden_size, mlp_size, num_layers, p0, tanh=True):
+        super().__init__()
+        self._nn = MLP(hidden_size, hidden_size, mlp_size, num_layers, tanh=tanh)
+        self._osc = LindxModel(p0)
+
+    def forward(self, x):
+        return self._osc.forward(x) + self._nn.forward(x)
+
+# NN module to select only odd elements of input
+class OddSel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        # x has shape (batch_size, time, hidden_size)
+        state_dim = x.shape[1]
+        return x[:,:,0:state_dim:2]
+
+
 ###################
 # Now we define the SDEs.
 #
@@ -83,7 +111,7 @@ class GeneratorFunc(torch.nn.Module):
     sde_type = 'stratonovich'
     noise_type = 'general'
 
-    def __init__(self, noise_size, hidden_size, mlp_size, num_layers):
+    def __init__(self, noise_size, hidden_size, mlp_size, num_layers, p0):
         super().__init__()
         self._noise_size = noise_size
         self._hidden_size = hidden_size
@@ -95,29 +123,31 @@ class GeneratorFunc(torch.nn.Module):
         # If you have problems with very high drift/diffusions then consider scaling these so that they squash to e.g.
         # [-3, 3] rather than [-1, 1].
         ###################
-        self._drift = MLP(1 + hidden_size, hidden_size, mlp_size, num_layers, tanh=True)
-        self._diffusion = MLP(1 + hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
+        self._drift = Drift(hidden_size, mlp_size, num_layers, p0, tanh=True)
+        self._diffusion = MLP(hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
 
     def f_and_g(self, t, x):
         # t has shape ()
         # x has shape (batch_size, hidden_size)
-        t = t.expand(x.size(0), 1)
-        tx = torch.cat([t, x], dim=1)
-        return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
+        # No time dependence of drift and diffucion
+        return self._drift(x), self._diffusion(x).view(x.size(0), self._hidden_size, self._noise_size)
 
 
 ###################
 # Now we wrap it up into something that computes the SDE.
 ###################
 class Generator(torch.nn.Module):
-    def __init__(self, data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers):
+    def __init__(self, data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers, p0):
         super().__init__()
         self._initial_noise_size = initial_noise_size
         self._hidden_size = hidden_size
 
         self._initial = MLP(initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False)
-        self._func = GeneratorFunc(noise_size, hidden_size, mlp_size, num_layers)
-        self._readout = torch.nn.Linear(hidden_size, data_size)
+        self._func = GeneratorFunc(noise_size, hidden_size, mlp_size, num_layers, p0)
+        # TODO this should just select the odd elements of the state!
+        # self._readout = torch.nn.Identity()
+        # self._readout = torch.nn.Linear(hidden_size, data_size)
+        self._readout = OddSel()
 
     def forward(self, ts, batch_size):
         # ts has shape (t_size,) and corresponds to the points we want to evaluate the SDE at.
@@ -143,7 +173,9 @@ class Generator(torch.nn.Module):
         # Normalise the data to the form that the discriminator expects, in particular including time as a channel.
         ###################
         ts = ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
-        return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
+        # return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2))
+        # TODO I found that the linear interpolation didn't work so well before
+        return torch.cat([ts, ys], dim=2)
 
 
 ###################
@@ -217,46 +249,26 @@ def get_data(batch_size, filename, device):
         # (iRegion, iTrial, iTime)
         # Convert to (iTime, iTrial, iRegion) to match the expected format from torchsde.sdeint
         ys = torch.permute(data, (2, 1, 0))
+        # TODO take only v1 and l-ips
+        ys = ys[:,:,1:3]
         dataset_size = ys.size(dim=1)
 
-    # dataset_size = 8192
-    # t_size = 64
-
-    # class OrnsteinUhlenbeckSDE(torch.nn.Module):
-    #     sde_type = 'ito'
-    #     noise_type = 'scalar'
-
-    #     def __init__(self, mu, theta, sigma):
-    #         super().__init__()
-    #         self.register_buffer('mu', torch.as_tensor(mu))
-    #         self.register_buffer('theta', torch.as_tensor(theta))
-    #         self.register_buffer('sigma', torch.as_tensor(sigma))
-
-    #     def f(self, t, y):
-    #         return self.mu * t - self.theta * y
-
-    #     def g(self, t, y):
-    #         return self.sigma.expand(y.size(0), 1, 1) * (2 * t / t_size)
-
-    # ou_sde = OrnsteinUhlenbeckSDE(mu=0.02, theta=0.1, sigma=0.4).to(device)
-    # y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1
-    # ts = torch.linspace(0, t_size - 1, t_size, device=device)
-    # ys = torchsde.sdeint(ou_sde, y0, ts, dt=1e-1)
 
     ###################
     # Typically important to normalise data. Note that the data is normalised with respect to the statistics of the
     # initial data, _not_ the whole time series. This seems to help the learning process, presumably because if the
     # initial condition is wrong then it's pretty hard to learn the rest of the SDE correctly.
     ###################
-    # y0_flat = ys[0].view(-1)
-    # y0_not_nan = y0_flat.masked_select(~torch.isnan(y0_flat))
-    # ys = (ys - y0_not_nan.mean()) / y0_not_nan.std()
+    y0_flat = ys[0].reshape(-1)
+    y0_not_nan = y0_flat.masked_select(~torch.isnan(y0_flat))
+    ys = (ys - y0_not_nan.mean()) / y0_not_nan.std()
 
     ###################
     # As discussed, time must be included as a channel for the discriminator.
     ###################
     ys = torch.cat([ts.unsqueeze(0).unsqueeze(-1).expand(dataset_size, t_size, 1),
                     ys.transpose(0, 1)], dim=2)
+    # print(ys.shape)
     # shape (dataset_size=1000, t_size=100, 1 + data_size=3)
 
     ###################
@@ -273,7 +285,7 @@ def get_data(batch_size, filename, device):
 ###################
 # We'll plot some results at the end.
 ###################
-def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
+def plot(ts, generator, dataloader, num_plot_samples, plot_locs, ):
     # Get samples
     real_samples, = next(iter(dataloader))
     assert num_plot_samples <= real_samples.size(0)
@@ -311,19 +323,20 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs):
     # Plot samples
     real_first = True
     generated_first = True
+    fig1, ax1 = plt.subplots()
     for real_sample_ in real_samples:
         kwargs = {'label': 'Real'} if real_first else {}
-        plt.plot(ts.cpu(), real_sample_.cpu(), color='dodgerblue', linewidth=0.5, alpha=0.7, **kwargs)
+        ax1.plot(ts.cpu(), real_sample_.cpu(), color='dodgerblue', linewidth=0.5, alpha=0.7, **kwargs)
         real_first = False
     for generated_sample_ in generated_samples:
         kwargs = {'label': 'Generated'} if generated_first else {}
-        plt.plot(ts.cpu(), generated_sample_.cpu(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
+        ax1.plot(ts.cpu(), generated_sample_.cpu(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
         generated_first = False
-    plt.legend()
-    plt.title(f"{num_plot_samples} samples from both real and generated distributions.")
+    ax1.legend()
+    ax1.title.set_text(f"{num_plot_samples} samples from both real and generated distributions.")
     plt.tight_layout()
-    plt.show()
-    plt.savefig('output.png')
+    # plt.show()
+    fig1.savefig('output.png')
 
 
 ###################
@@ -357,24 +370,24 @@ def evaluate_loss(ts, batch_size, dataloader, generator, discriminator):
 def main(
         # Architectural hyperparameters. These are quite small for illustrative purposes.
         initial_noise_size=4,  # How many noise dimensions to sample at the start of the SDE.
-        noise_size=4,          # How many dimensions the Brownian motion has.
-        hidden_size=16,        # How big the hidden size of the generator SDE and the discriminator CDE are.
-        mlp_size=16,           # How big the layers in the various MLPs are.
+        noise_size=2,          # How many dimensions the Brownian motion has.
+        hidden_size=4,        # How big the hidden size of the generator SDE and the discriminator CDE are.
+        mlp_size=4,           # How big the layers in the various MLPs are.
         num_layers=1,          # How many hidden layers to have in the various MLPs.
 
         # Training hyperparameters. Be prepared to tune these very carefully, as with any GAN.
-        generator_lr=2e-4,      # Learning rate often needs careful tuning to the problem.
-        discriminator_lr=1e-3,  # Learning rate often needs careful tuning to the problem.
-        batch_size=1024,        # Batch size.# TODO originally 1024
+        generator_lr=2e-1,      # Learning rate often needs careful tuning to the problem.
+        discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem.
+        batch_size=80,        # Batch size.# TODO originally 1024
         steps=10,            # How many steps to train both generator and discriminator for.
-        init_mult1=3,           # Changing the initial parameter size can help.
-        init_mult2=0.5,         #
+        init_mult1=10,           # Changing the initial parameter size can help.
+        init_mult2=100,         #
         weight_decay=0.01,      # Weight decay.
-        swa_step_start=5,    # When to start using stochastic weight averaging.
+        swa_step_start=1,    # When to start using stochastic weight averaging.
 
         # Evaluation and plotting hyperparameters
-        steps_per_print=2,                   # How often to print the loss.
-        num_plot_samples=50,                  # How many samples to use on the plots at the end.
+        steps_per_print=1,                   # How often to print the loss.
+        num_plot_samples=5,                  # How many samples to use on the plots at the end.
         plot_locs=(0.1, 0.3, 0.5, 0.7, 0.9),  # Plot some marginal distributions at this proportion of the way along.
 ):
     is_cuda = torch.cuda.is_available()
@@ -388,11 +401,12 @@ def main(
     infinite_train_dataloader = (elem for it in iter(lambda: train_dataloader, None) for elem in it)
 
     # Models
-    generator = Generator(data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers).to(device)
+    p0 = torch.tensor([62.0, 62.0, 0.1, 0.1])
+    generator = Generator(data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers, p0).to(device)
     discriminator = Discriminator(data_size, hidden_size, mlp_size, num_layers).to(device)
     # Weight averaging really helps with GAN training.
-    averaged_generator = swa_utils.AveragedModel(generator)
-    averaged_discriminator = swa_utils.AveragedModel(discriminator)
+    # averaged_generator = swa_utils.AveragedModel(generator)
+    # averaged_discriminator = swa_utils.AveragedModel(discriminator)
 
     # Picking a good initialisation is important!
     # In this case these were picked by making the parameters for the t=0 part of the generator be roughly the right
@@ -403,7 +417,10 @@ def main(
     with torch.no_grad():
         for param in generator._initial.parameters():
             param *= init_mult1
-        for param in generator._func.parameters():
+        for name, param in generator._func.named_parameters():
+            if name=="_drift._osc.p":
+            # Don't change the oscillator parameters, these are initialsed intentionally
+                continue
             param *= init_mult2
 
     # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
@@ -412,6 +429,7 @@ def main(
                                                    weight_decay=weight_decay)
 
     # Train both generator and discriminator.
+    losses = torch.zeros(steps)
     trange = tqdm.tqdm(range(steps))
     for step in trange:
         real_samples, = next(infinite_train_dataloader)
@@ -420,14 +438,18 @@ def main(
         generated_score = discriminator(generated_samples)
         real_score = discriminator(real_samples)
         loss = generated_score - real_score
-        loss.backward()
+        print("Loss calculated, updating parameters...")
+        loss.backward() # This takes AGES
 
+        # Generator is minimising so reverse the sign of the parameter gradients
         for param in generator.parameters():
             param.grad *= -1
+        # Update the parameters
         generator_optimiser.step()
         discriminator_optimiser.step()
-        generator_optimiser.zero_grad()
-        discriminator_optimiser.zero_grad()
+        # set_to_none apparently requires fewer memory operations: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+        generator_optimiser.zero_grad(set_to_none=True)
+        discriminator_optimiser.zero_grad(set_to_none=True)
 
         ###################
         # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
@@ -439,26 +461,39 @@ def main(
                     lim = 1 / module.out_features
                     module.weight.clamp_(-lim, lim)
 
+        print("Parameters updated, applying stochastic weight averaging (if requested)...")
         # Stochastic weight averaging typically improves performance.
-        if step > swa_step_start:
-            averaged_generator.update_parameters(generator)
-            averaged_discriminator.update_parameters(discriminator)
+        # if step > swa_step_start:
+        #     averaged_generator.update_parameters(generator)
+        #     averaged_discriminator.update_parameters(discriminator)
 
         if (step % steps_per_print) == 0 or step == steps - 1:
-            total_unaveraged_loss = evaluate_loss(ts, batch_size, train_dataloader, generator, discriminator)
+            # TODO the evaluate loss takes forever!
+            # total_unaveraged_loss = evaluate_loss(ts, batch_size, train_dataloader, generator, discriminator)
             if step > swa_step_start:
-                total_averaged_loss = evaluate_loss(ts, batch_size, train_dataloader, averaged_generator.module,
-                                                    averaged_discriminator.module)
-                trange.write(f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
-                             f"Loss (averaged): {total_averaged_loss:.4f}")
+                # total_averaged_loss = evaluate_loss(ts, batch_size, train_dataloader, averaged_generator.module,
+                                                    # averaged_discriminator.module)
+                # trange.write(f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f} "
+                            #  f"Loss (averaged): {total_averaged_loss:.4f}")
+                trange.write(f"Step: {step:3} Loss (averaged): {loss:.4f} ")
+                losses[step] = loss
             else:
-                trange.write(f"Step: {step:3} Loss (unaveraged): {total_unaveraged_loss:.4f}")
-    generator.load_state_dict(averaged_generator.module.state_dict())
-    discriminator.load_state_dict(averaged_discriminator.module.state_dict())
+                trange.write(f"Step: {step:3} Loss (unaveraged): {loss:.4f}")
+                losses[step] = loss
+    # generator.load_state_dict(averaged_generator.module.state_dict())
+    # discriminator.load_state_dict(averaged_discriminator.module.state_dict())
 
+    # Print the harmonic oscillator parameters
+    for name, param in generator.named_parameters():
+        if name=="_func._drift._osc.p":
+            print("Harmonic oscillator trained params: ", param.data)
     _, _, test_dataloader = get_data(batch_size=batch_size, filename=filename, device=device)
 
     plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
+    with torch.no_grad():
+        fig2, ax2 = plt.subplots()
+        ax2.plot(losses)
+    plt.show()
 
 
 if __name__ == '__main__':

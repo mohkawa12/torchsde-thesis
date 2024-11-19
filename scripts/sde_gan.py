@@ -73,7 +73,6 @@ class MLP(torch.nn.Module):
     def forward(self, x):
         return self._model(x)
 
-
 # Linear harmonic oscillator
 class LindxModel(torch.nn.Module):
     def __init__(self, p0):
@@ -102,6 +101,14 @@ class OddSel(torch.nn.Module):
         state_dim = x.shape[1]
         return x[:,:,0:state_dim:2]
 
+# NN module to scale the input
+class ScaleLinear(torch.nn.Module):
+    def __init__(self, init_scale):
+        super().__init__()
+        self.scale = torch.nn.Parameter(init_scale)
+
+    def forward(self, x):
+        return self.scale * x
 
 ###################
 # Now we define the SDEs.
@@ -110,7 +117,8 @@ class OddSel(torch.nn.Module):
 ###################
 class GeneratorFunc(torch.nn.Module):
     sde_type = 'stratonovich'
-    noise_type = 'general'
+    # noise_type = 'general'
+    noise_type = 'diagonal'
 
     def __init__(self, noise_size, hidden_size, mlp_size, num_layers, p0):
         super().__init__()
@@ -125,13 +133,17 @@ class GeneratorFunc(torch.nn.Module):
         # [-3, 3] rather than [-1, 1].
         ###################
         self._drift = Drift(hidden_size, mlp_size, num_layers, p0, tanh=True)
-        self._diffusion = MLP(hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
+        # self._diffusion = MLP(hidden_size, hidden_size * noise_size, mlp_size, num_layers, tanh=True)
+        # Try a diagonal scale for noise
+        scale = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        self._diffusion = ScaleLinear(scale)
 
     def f_and_g(self, t, x):
         # t has shape ()
         # x has shape (batch_size, hidden_size)
         # No time dependence of drift and diffucion
-        return self._drift(x), self._diffusion(x).view(x.size(0), self._hidden_size, self._noise_size)
+        # return self._drift(x), self._diffusion(x).view(x.size(0), self._hidden_size, self._noise_size)
+        return self._drift(x), self._diffusion(x)
 
 
 ###################
@@ -145,7 +157,6 @@ class Generator(torch.nn.Module):
 
         self._initial = MLP(initial_noise_size, hidden_size, mlp_size, num_layers, tanh=False)
         self._func = GeneratorFunc(noise_size, hidden_size, mlp_size, num_layers, p0)
-        # TODO this should just select the odd elements of the state!
         # self._readout = torch.nn.Identity()
         # self._readout = torch.nn.Linear(hidden_size, data_size)
         self._readout = OddSel()
@@ -331,16 +342,17 @@ def plot(ts, generator, dataloader, num_plot_samples, plot_locs, ):
     # Plot samples
     real_first = True
     generated_first = True
-    fig1, ax1 = plt.subplots()
+    fig1, (ax1, ax2) = plt.subplots(2,1)
     for real_sample_ in real_samples:
         kwargs = {'label': 'Real'} if real_first else {}
         ax1.plot(ts.cpu(), real_sample_.cpu(), color='dodgerblue', linewidth=0.5, alpha=0.7, **kwargs)
         real_first = False
     for generated_sample_ in generated_samples:
         kwargs = {'label': 'Generated'} if generated_first else {}
-        ax1.plot(ts.cpu(), generated_sample_.cpu(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
+        ax2.plot(ts.cpu(), generated_sample_.cpu(), color='crimson', linewidth=0.5, alpha=0.7, **kwargs)
         generated_first = False
     ax1.legend()
+    ax2.legend()
     ax1.title.set_text(f"{num_plot_samples} samples from both real and generated distributions.")
     plt.tight_layout()
     return fig1
@@ -373,29 +385,41 @@ def evaluate_loss(ts, batch_size, dataloader, generator, discriminator):
             total_loss += loss.item() * batch_size
     return total_loss / total_samples
 
+def print_linosc_params(model):
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name=="_func._drift._osc.p":
+                print("Harmonic oscillator trained params: ", param.data)
+
+def plot_linosc_params(ax, iter, model):
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name=="_func._drift._osc.p":
+                params = param.cpu().data[2:]
+                ax.scatter(iter*torch.ones(params.shape), params, c=['g', 'b'])
 
 def main(
         # Architectural hyperparameters. These are quite small for illustrative purposes.
         initial_noise_size=4,  # How many noise dimensions to sample at the start of the SDE.
-        noise_size=2,          # How many dimensions the Brownian motion has.
+        noise_size=4,          # How many dimensions the Brownian motion has.
         hidden_size=4,        # How big the hidden size of the generator SDE and the discriminator CDE are.
-        mlp_size=4,           # How big the layers in the various MLPs are.
-        num_layers=4,          # How many hidden layers to have in the various MLPs.
+        mlp_size=16,           # How big the layers in the various MLPs are.
+        num_layers=3,          # How many hidden layers to have in the various MLPs.
 
         # Training hyperparameters. Be prepared to tune these very carefully, as with any GAN.
-        generator_lr=1e1,      # Learning rate often needs careful tuning to the problem.
-        discriminator_lr=5e0,  # Learning rate often needs careful tuning to the problem.
-        batch_size=500,        # Batch size.# TODO originally 1024
-        steps=15,            # How many steps to train generator for.
-        disc_steps = 20,     # How many steps to train the discriminator for (per generator step)
-        init_mult1=3,           # Changing the initial parameter size can help.
-        init_mult2=100,         #
+        generator_lr=1e-1,      # Learning rate often needs careful tuning to the problem. (1e-1 was good)
+        discriminator_lr=1e-2,  # Learning rate often needs careful tuning to the problem. (1e-1 was good)
+        batch_size=700,        # Batch size.# TODO originally 1024
+        steps=20,            # How many steps to train generator for.
+        disc_steps = 15,     # How many steps to train the discriminator for (per generator step)
+        init_mult1=4,           # Changing the initial parameter size can help.
+        init_mult2=0.5,         #
         weight_decay=0.01,      # Weight decay.
         swa_step_start=1,    # When to start using stochastic weight averaging.
 
         # Evaluation and plotting hyperparameters
         steps_per_print=1,                   # How often to print the loss.
-        steps_per_plot=2,                    # how often to save a plot.
+        steps_per_plot=5,                    # how often to save a plot.
         num_plot_samples=5,                  # How many samples to use on the plots at the end.
         plot_locs=(0.1, 0.3, 0.5, 0.7, 0.9),  # Plot some marginal distributions at this proportion of the way along.
 ):
@@ -444,13 +468,19 @@ def main(
                 module.weight.clamp_(-lim, lim)
 
     # Optimisers. Adadelta turns out to be a much better choice than SGD or Adam, interestingly.
-    generator_optimiser = torch.optim.Adadelta(generator.parameters(), lr=generator_lr, weight_decay=weight_decay)
+    # generator_optimiser = torch.optim.Adadelta(generator.parameters(), lr=generator_lr, weight_decay=weight_decay)
+    generator_optimiser = torch.optim.Adam(generator.parameters(), lr=generator_lr, weight_decay=weight_decay)
     # Discriminator should maximise the function
-    discriminator_optimiser = torch.optim.Adadelta(discriminator.parameters(), lr=discriminator_lr,
+    # discriminator_optimiser = torch.optim.Adadelta(discriminator.parameters(), lr=discriminator_lr,
+                                                #    weight_decay=weight_decay, maximize=True)
+    discriminator_optimiser = torch.optim.Adam(discriminator.parameters(), lr=discriminator_lr,
                                                    weight_decay=weight_decay, maximize=True)
-
     # Train both generator and discriminator.
-    losses = torch.zeros(steps*(disc_steps+1))
+    fig4, ax4 = plt.subplots()
+    ax4.title.set_text("Linear Oscillator Coupling over Iterations")
+    losses_gen = torch.zeros(steps*(disc_steps+1))
+    losses_disc = torch.zeros(steps*(disc_steps+1))
+    score_real = torch.zeros(steps*(disc_steps+1))
     trange = tqdm.tqdm(range(steps))
     for step in trange:
         # with profiler.profile(use_cuda=True) as prof:
@@ -467,9 +497,13 @@ def main(
             discriminator_optimiser.step()
             # set_to_none apparently requires fewer memory operations: https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html
             discriminator_optimiser.zero_grad(set_to_none=True)
+            total_iter = step*(disc_steps+1)+disc_step
             with torch.no_grad():
-                losses[step*(disc_steps+1)+disc_step] = loss.item()
+                losses_disc[total_iter] = loss.item()
+                losses_gen[total_iter] = generated_score.item()
+                score_real[total_iter] = real_score.item()
                 print("Loss: ", loss.item())
+            plot_linosc_params(ax4, total_iter, generator)
             ###################
             # We constrain the Lipschitz constant of the discriminator using carefully-chosen clipping (and the use of
             # LipSwish activation functions).
@@ -486,10 +520,14 @@ def main(
         generated_samples = generator(ts, batch_size)
         generated_score = discriminator(generated_samples)
         loss = generated_score
+        total_iter = step*(disc_steps+1)+disc_steps
         with torch.no_grad():
             record_loss = generated_score.cpu() - real_score.cpu()
-            losses[step*(disc_steps+1)+disc_steps] = record_loss
+            losses_disc[total_iter] = record_loss
+            losses_gen[total_iter] = loss.item()
+            score_real[total_iter] = real_score.item()
             print(f"Step: {step} Loss: {record_loss:.15f}")
+        plot_linosc_params(ax4, total_iter, generator)
         loss.backward()
 
         # Moved this to discriminator to be more consistent with the literature, practically it makes no difference
@@ -522,23 +560,38 @@ def main(
             fig = plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
             title = f"output-{step}.png"
             fig.savefig(title)
+            
+        print_linosc_params(generator)
 
     # generator.load_state_dict(averaged_generator.module.state_dict())
     # discriminator.load_state_dict(averaged_discriminator.module.state_dict())
 
 
     # Print the harmonic oscillator parameters
-    for name, param in generator.named_parameters():
-        if name=="_func._drift._osc.p":
-            print("Harmonic oscillator trained params: ", param.data)
+    print_linosc_params(generator)
     _, _, test_dataloader = get_data(batch_size=batch_size, filename=filename, device=device)
 
     fig = plot(ts, generator, test_dataloader, num_plot_samples, plot_locs)
+    title = "finaloutput.png"
+    fig.savefig(title)
+    title = "parameters.png"
+    fig4.savefig(title)
     with torch.no_grad():
+        # Generator and discriminator losses
         fig2, ax2 = plt.subplots()
-        ax2.plot(losses)
+        ax2.plot(losses_disc, label='disc')
+        ax2.plot(losses_gen, label='gen')
+        ax2.legend()
         ax2.title.set_text(f"Loss over iterations")
         fig2.savefig("losses.png")
+        
+        # Real and fake discriminator scores
+        fig3, ax3 = plt.subplots()
+        ax3.plot(losses_gen, label='fake' )
+        ax3.plot(score_real, label='real' )
+        ax3.legend()
+        ax3.title.set_text("Discriminator score over iterations")
+        fig3.savefig("scores.png")
     # plt.show() # too many plots to output
 
 

@@ -45,7 +45,7 @@ class Func(torch.nn.Module):
 
     def __init__(self, xdim):
         super().__init__()
-        self._noise_size = 1
+        self._noise_size = 3
         self._hidden_size = 4
         p0 = torch.tensor([62.0, 31.0, 0.0, 0.0])
         self._drift = LindxModel(p0)
@@ -61,7 +61,7 @@ class Func(torch.nn.Module):
 ts = torch.linspace(0, 1, 500)
 xdim = 4
 func = Func(xdim)
-x0 = torch.ones(1, xdim)
+x0 = torch.ones(2, xdim)
 xs = torchsde.sdeint_adjoint(func, x0, ts, method='reversible_heun', dt=1/300,
                                 adjoint_method='adjoint_reversible_heun',)
                                 
